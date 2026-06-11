@@ -34,13 +34,13 @@ python3 -m venv ~/.local/share/essaedit-venv
 Then make it callable. For **fish**:
 
 ```
-alias --save essaedit "~/.local/share/essaedit-venv/bin/python3 /path/to/essaedit.py"
+alias --save essa "~/.local/share/essaedit-venv/bin/python3 /path/to/essaedit.py"
 ```
 
 For **bash/zsh**, add to your `~/.bashrc` / `~/.zshrc`:
 
 ```
-alias essaedit='~/.local/share/essaedit-venv/bin/python3 /path/to/essaedit.py'
+alias essa='~/.local/share/essaedit-venv/bin/python3 /path/to/essaedit.py'
 ```
 
 Or just `chmod +x essaedit.py` and point the shebang at the venv python.
@@ -50,9 +50,9 @@ Optional: `pip install pyperclip` lets Ctrl+C/X/V use the system clipboard inste
 ## Usage
 
 ```
-essaedit notes.md          # opens (or creates on save)
-essaedit --no-mouse        # start with mouse capture off
-essaedit --no-spell        # start with spell check off
+essa notes.md          # opens (or creates on save)
+essa --no-mouse        # start with mouse capture off
+essa --no-spell        # start with spell check off
 ```
 
 ## Keys

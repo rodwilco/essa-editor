@@ -994,7 +994,7 @@ class Editor:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="essaedit", description="Terminal Markdown word processor with live styling and spell check."
+        prog="essa", description="Terminal Markdown word processor with live styling and spell check."
     )
     parser.add_argument("file", nargs="?", help="Markdown file to open (created on save if missing)")
     parser.add_argument("--no-mouse", action="store_true", help="start with mouse capture disabled")
