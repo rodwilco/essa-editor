@@ -203,6 +203,13 @@ class MarkdownSpellLexer(Lexer):
         self.editor = editor
         self._cache: dict = {}
 
+    def invalidation_hash(self):
+        # BufferControl caches lexed lines by (document.text, lexer.invalidation_hash()).
+        # Spell state and the personal dictionary change the output WITHOUT changing the
+        # text, so fold them in here — otherwise toggling spell check off (F3) leaves
+        # already-marked words red until the next edit.
+        return (self.editor.spell_enabled, self.editor.dict_version)
+
     # -- helpers ------------------------------------------------------------
 
     @staticmethod
