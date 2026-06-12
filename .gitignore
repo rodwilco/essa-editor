@@ -5,3 +5,9 @@ __pycache__/
 venv/
 *-venv/
 .DS_Store
+
+# Fable delivery artifacts + local test caches (kept on disk, out of git)
+*.bak
+fable.txt
+files.zip
+.pytest_cache/
