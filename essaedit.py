@@ -44,8 +44,12 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.clipboard import InMemoryClipboard
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_width
+from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
     ConditionalContainer,
@@ -59,9 +63,11 @@ from prompt_toolkit.layout import (
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.margins import NumberedMargin, ScrollbarMargin
+from prompt_toolkit.layout.screen import _CHAR_CACHE
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.search import start_search
 from prompt_toolkit.styles import Style
+from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame, SearchToolbar, TextArea
 
 from spellchecker import SpellChecker
@@ -362,6 +368,374 @@ class MarkdownSpellLexer(Lexer):
 
 
 # --------------------------------------------------------------------------
+# Word-aware soft wrap
+#
+# prompt_toolkit's Window wraps character-by-character (containers.py,
+# Window._copy_body: `if wrap_lines and x + char_width > width`).  Two pieces
+# must agree on where display rows break: _copy_body (rendering + the
+# rowcol_to_yx cursor map) and UIContent.get_height_for_line (used by
+# _scroll_when_linewrapping to keep the cursor in view).  Both are routed
+# through one break computation below, so they cannot diverge.  The buffer is
+# never modified — this is purely a display transform.  Cursor mapping needs
+# no extra bookkeeping: rowcol_to_yx is keyed by *logical* column and built in
+# the same render loop, so moving the break points moves the cells, not the
+# mapping semantics.
+#
+# NOTE: WordWrapWindow._copy_body is a copy of prompt_toolkit 3.0.52's
+# Window._copy_body with three marked changes.  If you upgrade prompt_toolkit
+# past 3.0.x, re-diff against the new upstream before trusting it.
+# --------------------------------------------------------------------------
+
+_WRAP_BREAK_CACHE: dict = {}
+_NO_BREAKS: frozenset = frozenset()
+
+
+def _display_text(fragments) -> str:
+    """Plain text of a rendered line in the same order _copy_body consumes
+    characters: zero-width escape fragments are skipped, everything else kept."""
+    parts = []
+    for frag in fragments:
+        if "[ZeroWidthEscape]" in frag[0]:
+            continue
+        parts.append(frag[1])
+    return "".join(parts)
+
+
+def _word_wrap_breaks(text: str, width: int) -> frozenset:
+    """Greedy word wrap.  Returns the logical column indices where a new
+    display row starts.  A break is placed after the last space/tab that fits
+    on the row; a single token wider than the row (long URL, giant word) falls
+    back to a character break so rendering can always make progress.  Widths
+    come from wcwidth via get_cwidth, so emoji/CJK double-width cells are
+    measured, not counted."""
+    key = (text, width)
+    cached = _WRAP_BREAK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_WRAP_BREAK_CACHE) > 4096:
+        _WRAP_BREAK_CACHE.clear()
+
+    widths = [get_cwidth(c) for c in text]
+    breaks = []
+    x = 0            # display cells used on the current row
+    row_start = 0    # logical column where the current row starts
+    break_opp = None # column where a word break is allowed (char after whitespace)
+
+    for col, c in enumerate(text):
+        w = widths[col]
+        if x + w > width and col > row_start:
+            if break_opp is not None and break_opp > row_start:
+                br = break_opp          # move the partial word down whole
+            else:
+                br = col                # token wider than the row: hard break
+            breaks.append(br)
+            row_start = br
+            x = sum(widths[br:col])     # cells the carried word already uses
+            break_opp = None
+            if x + w > width and col > row_start:
+                breaks.append(col)      # carried word + this char still too wide
+                row_start = col
+                x = 0
+        if c in " \t":
+            break_opp = col + 1
+        x += w
+
+    result = frozenset(breaks)
+    _WRAP_BREAK_CACHE[key] = result
+    return result
+
+
+def _breaks_for_fragments(fragments, width: int) -> frozenset:
+    if width <= 0:
+        return _NO_BREAKS
+    return _word_wrap_breaks(_display_text(fragments), width)
+
+
+class WordWrapBufferControl(BufferControl):
+    """BufferControl whose UIContent reports word-wrap-aware line heights.
+
+    Window._scroll_when_linewrapping asks UIContent.get_height_for_line how
+    many display rows each logical line occupies (and, via slice_stop, which
+    display row the cursor sits on).  Those answers must match what
+    WordWrapWindow actually renders, or scrolling drifts and the cursor can
+    leave the viewport on long paragraphs."""
+
+    def create_content(self, width, height, preview_search=False):
+        content = super().create_content(width, height, preview_search)
+        stock = content.get_height_for_line
+        cache = content._line_heights_cache
+        get_line = content.get_line
+
+        def get_height_for_line(lineno, width, get_line_prefix, slice_stop=None):
+            if get_line_prefix is not None:
+                # Continuation prefixes change the usable width per row; this
+                # editor doesn't use them, so defer to the stock estimate.
+                return stock(lineno, width, get_line_prefix, slice_stop)
+            key = ("wordwrap", get_app().render_counter, lineno, width, slice_stop)
+            try:
+                return cache[key]
+            except KeyError:
+                pass
+            if width <= 0:
+                h = 10**8
+            else:
+                breaks = _breaks_for_fragments(get_line(lineno), width)
+                if slice_stop is None:
+                    h = len(breaks) + 1
+                else:
+                    # Rows consumed by text before the cursor == breaks that
+                    # fall strictly before it, plus the row it sits on.
+                    h = sum(1 for b in breaks if b < slice_stop) + 1
+            cache[key] = h
+            return h
+
+        content.get_height_for_line = get_height_for_line
+        return content
+
+
+class WordWrapWindow(Window):
+    """Window that breaks soft-wrapped lines at word boundaries.
+
+    _copy_body is copied from prompt_toolkit 3.0.52 Window._copy_body.
+    Changes are marked with `# WORD-WRAP`.  Everything else — the cursor map
+    (rowcol_to_yx), wide-char cell erasure, zero-width combining-character
+    merging, line prefixes, alignment — is upstream code, untouched."""
+
+    def _copy_body(
+        self,
+        ui_content,
+        new_screen,
+        write_position,
+        move_x,
+        width,
+        vertical_scroll=0,
+        horizontal_scroll=0,
+        wrap_lines=False,
+        highlight_lines=False,
+        vertical_scroll_2=0,
+        always_hide_cursor=False,
+        has_focus=False,
+        align=WindowAlign.LEFT,
+        get_line_prefix=None,
+    ):
+        xpos = write_position.xpos + move_x
+        ypos = write_position.ypos
+        line_count = ui_content.line_count
+        new_buffer = new_screen.data_buffer
+        empty_char = _CHAR_CACHE["", ""]
+
+        # Map visible line number to (row, col) of input.
+        # 'col' will always be zero if line wrapping is off.
+        visible_line_to_row_col = {}
+
+        # Maps (row, col) from the input to (y, x) screen coordinates.
+        rowcol_to_yx = {}
+
+        def copy_line(line, lineno, x, y, is_input=False, breaks=_NO_BREAKS):  # WORD-WRAP: breaks arg
+            """
+            Copy over a single line to the output screen. This can wrap over
+            multiple lines in the output. It will call the prefix (prompt)
+            function before every line.
+            """
+            if is_input:
+                current_rowcol_to_yx = rowcol_to_yx
+            else:
+                current_rowcol_to_yx = {}  # Throwaway dictionary.
+
+            # Draw line prefix.
+            if is_input and get_line_prefix:
+                prompt = to_formatted_text(get_line_prefix(lineno, 0))
+                x, y = copy_line(prompt, lineno, x, y, is_input=False)
+
+            # Scroll horizontally.
+            skipped = 0  # Characters skipped because of horizontal scrolling.
+            if horizontal_scroll and is_input:
+                h_scroll = horizontal_scroll
+                line = explode_text_fragments(line)
+                while h_scroll > 0 and line:
+                    h_scroll -= get_cwidth(line[0][1])
+                    skipped += 1
+                    del line[:1]  # Remove first character.
+
+                x -= h_scroll  # When scrolling over double width character,
+                # this can end up being negative.
+
+            # Align this line. (Note that this doesn't work well when we use
+            # get_line_prefix and that function returns variable width prefixes.)
+            if align == WindowAlign.CENTER:
+                line_width = fragment_list_width(line)
+                if line_width < width:
+                    x += (width - line_width) // 2
+            elif align == WindowAlign.RIGHT:
+                line_width = fragment_list_width(line)
+                if line_width < width:
+                    x += width - line_width
+
+            col = 0
+            wrap_count = 0
+            for style, text, *_ in line:
+                new_buffer_row = new_buffer[y + ypos]
+
+                # Remember raw VT escape sequences. (E.g. FinalTerm's
+                # escape sequences.)
+                if "[ZeroWidthEscape]" in style:
+                    new_screen.zero_width_escapes[y + ypos][x + xpos] += text
+                    continue
+
+                for c in text:
+                    char = _CHAR_CACHE[c, style]
+                    char_width = char.width
+
+                    # WORD-WRAP: break at precomputed word boundaries; the
+                    # original char-level check stays as a safety net.
+                    if wrap_lines and (col in breaks or x + char_width > width):
+                        visible_line_to_row_col[y + 1] = (
+                            lineno,
+                            # WORD-WRAP: record the true logical start column
+                            # of the continuation row (exact for wide chars).
+                            col if is_input else visible_line_to_row_col[y][1] + x,
+                        )
+                        y += 1
+                        wrap_count += 1
+                        x = 0
+
+                        # Insert line prefix (continuation prompt).
+                        if is_input and get_line_prefix:
+                            prompt = to_formatted_text(
+                                get_line_prefix(lineno, wrap_count)
+                            )
+                            x, y = copy_line(prompt, lineno, x, y, is_input=False)
+
+                        new_buffer_row = new_buffer[y + ypos]
+
+                        if y >= write_position.height:
+                            return x, y  # Break out of all for loops.
+
+                    # Set character in screen and shift 'x'.
+                    if x >= 0 and y >= 0 and x < width:
+                        new_buffer_row[x + xpos] = char
+
+                        # When we print a multi width character, make sure
+                        # to erase the neighbors positions in the screen.
+                        # (The empty string if different from everything,
+                        # so next redraw this cell will repaint anyway.)
+                        if char_width > 1:
+                            for i in range(1, char_width):
+                                new_buffer_row[x + xpos + i] = empty_char
+
+                        # If this is a zero width characters, then it's
+                        # probably part of a decomposed unicode character.
+                        # See: https://en.wikipedia.org/wiki/Unicode_equivalence
+                        # Merge it in the previous cell.
+                        elif char_width == 0:
+                            # Handle all character widths. If the previous
+                            # character is a multiwidth character, then
+                            # merge it two positions back.
+                            for pw in [2, 1]:  # Previous character width.
+                                if (
+                                    x - pw >= 0
+                                    and new_buffer_row[x + xpos - pw].width == pw
+                                ):
+                                    prev_char = new_buffer_row[x + xpos - pw]
+                                    char2 = _CHAR_CACHE[
+                                        prev_char.char + c, prev_char.style
+                                    ]
+                                    new_buffer_row[x + xpos - pw] = char2
+
+                        # Keep track of write position for each character.
+                        current_rowcol_to_yx[lineno, col + skipped] = (
+                            y + ypos,
+                            x + xpos,
+                        )
+
+                    col += 1
+                    x += char_width
+            return x, y
+
+        # Copy content.
+        def copy():
+            y = -vertical_scroll_2
+            lineno = vertical_scroll
+
+            while y < write_position.height and lineno < line_count:
+                # Take the next line and copy it in the real screen.
+                line = ui_content.get_line(lineno)
+
+                visible_line_to_row_col[y] = (lineno, horizontal_scroll)
+
+                # WORD-WRAP: compute break columns for this logical line.
+                if wrap_lines:
+                    line_breaks = _breaks_for_fragments(line, width)
+                else:
+                    line_breaks = _NO_BREAKS
+
+                # Copy margin and actual line.
+                x = 0
+                x, y = copy_line(line, lineno, x, y, is_input=True, breaks=line_breaks)
+
+                lineno += 1
+                y += 1
+            return y
+
+        copy()
+
+        def cursor_pos_to_screen_pos(row, col):
+            "Translate row/col from UIContent to real Screen coordinates."
+            try:
+                y, x = rowcol_to_yx[row, col]
+            except KeyError:
+                # Normally this should never happen. (It is a bug, if it happens.)
+                # But to be sure, return (0, 0)
+                return Point(x=0, y=0)
+            else:
+                return Point(x=x, y=y)
+
+        # Set cursor and menu positions.
+        if ui_content.cursor_position:
+            screen_cursor_position = cursor_pos_to_screen_pos(
+                ui_content.cursor_position.y, ui_content.cursor_position.x
+            )
+
+            if has_focus:
+                new_screen.set_cursor_position(self, screen_cursor_position)
+
+                if always_hide_cursor:
+                    new_screen.show_cursor = False
+                else:
+                    new_screen.show_cursor = ui_content.show_cursor
+
+                self._highlight_digraph(new_screen)
+
+            if highlight_lines:
+                self._highlight_cursorlines(
+                    new_screen,
+                    screen_cursor_position,
+                    xpos,
+                    ypos,
+                    width,
+                    write_position.height,
+                )
+
+        # Draw input characters from the input processor queue.
+        if has_focus and ui_content.cursor_position:
+            self._show_key_processor_key_buffer(new_screen)
+
+        # Set menu position.
+        if ui_content.menu_position:
+            new_screen.set_menu_position(
+                self,
+                cursor_pos_to_screen_pos(
+                    ui_content.menu_position.y, ui_content.menu_position.x
+                ),
+            )
+
+        # Update output screen height.
+        new_screen.height = max(new_screen.height, ypos + write_position.height)
+
+        return visible_line_to_row_col, rowcol_to_yx
+
+
+# --------------------------------------------------------------------------
 # Editor application
 # --------------------------------------------------------------------------
 
@@ -411,13 +785,13 @@ class Editor:
         # ---- widgets ----
         self.lexer = MarkdownSpellLexer(self)
         self.search_toolbar = SearchToolbar()
-        self.buffer_control = BufferControl(
+        self.buffer_control = WordWrapBufferControl(
             buffer=self.buffer,
             lexer=self.lexer,
             search_buffer_control=self.search_toolbar.control,
             focus_on_click=True,
         )
-        self.editor_window = Window(
+        self.editor_window = WordWrapWindow(
             content=self.buffer_control,
             wrap_lines=Condition(lambda: self.wrap_enabled),
             left_margins=[NumberedMargin()],
