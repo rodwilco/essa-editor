@@ -949,11 +949,26 @@ class Editor:
             frags.append(("class:status.msg", f"   {self.message}"))
         return frags
 
+    @staticmethod
+    def _battery_fragment():
+        for bat in ("BAT1", "BAT0"):
+            cap_path = Path(f"/sys/class/power_supply/{bat}/capacity")
+            stat_path = Path(f"/sys/class/power_supply/{bat}/status")
+            if cap_path.exists():
+                try:
+                    pct = cap_path.read_text().strip()
+                    status = stat_path.read_text().strip() if stat_path.exists() else ""
+                    icon = "▲" if status == "Charging" else ("=" if status == "Full" else "▼")
+                    return ("class:status", f" {icon}{pct}% ")
+                except OSError:
+                    pass
+        return None
+
     def _status_right(self):
         doc = self.buffer.document
         mouse = ("class:status", " Mouse:ON ") if self.mouse_enabled else ("class:status.off", " Mouse:OFF ")
         spell = ("class:status", " Spell:ON ") if self.spell_enabled else ("class:status.off", " Spell:OFF ")
-        return [
+        frags = [
             ("class:status", f" Ln {doc.cursor_position_row + 1}, Col {doc.cursor_position_col + 1} "),
             ("class:status", f"| W:{self.word_count} |"),
             mouse,
@@ -961,6 +976,10 @@ class Editor:
             spell,
             ("class:status", "| F1 Help "),
         ]
+        bat = self._battery_fragment()
+        if bat:
+            frags += [("class:status", "|"), bat]
+        return frags
 
     def _prompt_label(self):
         return " Open file: " if self.mode == "open" else " Save as: "
