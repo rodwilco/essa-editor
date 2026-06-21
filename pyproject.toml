@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "essa-editor"
+version = "1.0.0"
+description = "Terminal Markdown word processor with live inline styling and spell check"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Colin Lewis", email = "rodwilco@gmail.com" }]
+requires-python = ">=3.8"
+dependencies = [
+    "prompt_toolkit>=3.0.50",
+    "pyspellchecker>=0.8",
+]
+keywords = ["markdown", "editor", "terminal", "tui", "writer"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Editors",
+]
+
+[project.urls]
+Homepage = "https://github.com/rodwilco/essa-editor"
+Repository = "https://github.com/rodwilco/essa-editor"
+
+[project.scripts]
+essa = "essa.essa:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["essa*"]
